@@ -117,12 +117,12 @@ int find_user(std::string username){
   for(Client c : client_db){
     if(c.username == username){
       return index;
-      std::cout << "find_user works" << std::endl;
+      
     }
     index++;
   }
 
-  std::cout << "find_user doesn't work" << std::endl;
+  
 
   return -1;
 }
@@ -593,7 +593,9 @@ void RunSlave(std::string port_no, pid_t master_pid, std::string hostname) {
   int status;
   while(1){
 
-    status = kill(master_pid, 0);
+    status = waitpid(master_pid, NULL, 0);
+
+    std::cout << status << std::endl;
 
     if(status == -1) {
 

@@ -287,6 +287,7 @@ void Client::processTimeline()
     // and you can terminate the client program by pressing
     // CTRL-C (SIGINT)
 	// ------------------------------------------------------------
+    return;
 }
 
 IReply Client::List() {
@@ -389,46 +390,51 @@ IReply Client::Login() {
 
 void Client::Timeline(const std::string& username) {
   
+    while(true) {
+        
+        Request request;
+        request.set_username(username);
 
-    Request request;
-    request.set_username(username);
-
-    //get latest follower
-    ListReply list_reply;
-    ClientContext context1;
-    Status status = stub_->Subscription(&context1, request, &list_reply);
-
-
-    ClientContext context;
-    std::shared_ptr<ClientReaderWriter<Message, Message>> stream(
-            stub_->Timeline(&context));
+        //get latest follower
+        ListReply list_reply;
+        ClientContext context1;
+        Status status = stub_->Subscription(&context1, request, &list_reply);
 
 
-    //Thread used to read chat messages and send them to the server
-    std::thread writer([username, stream]() {
+        ClientContext context;
+        std::shared_ptr<ClientReaderWriter<Message, Message>> stream(
+                stub_->Timeline(&context));
+
+
+        //Thread used to read chat messages and send them to the server
+        std::thread writer([username, stream]() {
             std::string input = "Set Stream";
             Message m = MakeMessage(username, input);
             stream->Write(m);
             while (1) {
-            input = getPostMessage(in);
-            m = MakeMessage(username, input);
-            stream->Write(m);
+                input = getPostMessage(in);
+                m = MakeMessage(username, input);
+                stream->Write(m);
             }
-            stream->WritesDone();
+
+                stream->WritesDone();
             });
 
-    std::thread reader([username, stream]() {
-            Message m;
-            while(stream->Read(&m)){
+        std::thread reader([username, stream]() {
+                Message m;
+                while(stream->Read(&m)){
 
-            google::protobuf::Timestamp temptime = m.timestamp();
-            std::time_t time = temptime.seconds();
-            displayPostMessage(m.username(), m.msg(), time);
-            }
-            });
+                google::protobuf::Timestamp temptime = m.timestamp();
+                std::time_t time = temptime.seconds();
+                displayPostMessage(m.username(), m.msg(), time);
+                }
+                });
 
-    //Wait for the threads to finish
-    writer.join();
-    reader.join();
+        //Wait for the threads to finish
+       
+        reader.join();
+        writer.join();
+        
+    }
 }
 
