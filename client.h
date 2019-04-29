@@ -49,7 +49,7 @@ struct IReply
 class IClient
 {
     public:
-        void run_client() { run(); }
+        void run_client(std::ifstream& testfile) { run(testfile); }
 
     protected:
         /*
@@ -61,27 +61,29 @@ class IClient
 
     private:
 
-        void run();
+        void run(std::ifstream& testfile);
 
         void displayTitle() const;
-        std::string getCommand() const;
-        void displayCommandReply(const std::string& comm, const IReply& reply) const;
+        std::string getCommand(std::ifstream& testfile) const;
+        void displayCommandReply(const std::string& comm, const IReply& reply) ;
         void toUpperCase(std::string& str) const;
 };
 
-void IClient::run()
+void IClient::run(std::ifstream& testfile)
 {
     int ret = connectTo();
+    
     if (ret < 0) {
         std::cout << "connection failed: " << ret << std::endl;
         exit(1);
     }
     displayTitle();
     while (1) {
-        std::string cmd = getCommand();
+        std::string cmd = getCommand(testfile);
         IReply reply = processCommand(cmd);
         displayCommandReply(cmd, reply);
-        if (reply.comm_status == SUCCESS && cmd == "TIMELINE") {
+        if (reply.grpc_status.ok() && reply.comm_status == SUCCESS
+                && cmd == "TIMELINE") {
             std::cout << "Now you are in the timeline" << std::endl;
             processTimeline();
         }
@@ -99,12 +101,17 @@ void IClient::displayTitle() const
     std::cout << "=====================================\n";
 }
 
-std::string IClient::getCommand() const
+std::string IClient::getCommand(std::ifstream& testfile) const
 {
 	std::string input;
 	while (1) {
 		std::cout << "Cmd> ";
-		std::getline(std::cin, input);
+  	        if(testfile.is_open()){
+    		    std::getline(testfile, input); 
+                }
+                else{
+    		    std::getline(std::cin, input);
+                }
 		std::size_t index = input.find_first_of(" ");
 		if (index != std::string::npos) {
 			std::string cmd = input.substr(0, index);
@@ -127,7 +134,7 @@ std::string IClient::getCommand() const
 	return input;
 }
 
-void IClient::displayCommandReply(const std::string& comm, const IReply& reply) const
+void IClient::displayCommandReply(const std::string& comm, const IReply& reply)  
 {
 	if (reply.grpc_status.ok()) {
 		switch (reply.comm_status) {
@@ -165,7 +172,8 @@ void IClient::displayCommandReply(const std::string& comm, const IReply& reply) 
 				break;
 		}
 	} else {
-		std::cout << "grpc failed: " << reply.grpc_status.error_message() << std::endl;
+		//std::cout << "grpc failed: " << reply.grpc_status.error_message() << std::endl;
+		int ret = connectTo();
 	}
 }
 
@@ -179,24 +187,31 @@ void IClient::toUpperCase(std::string& str) const
 /*
  * get/displayPostMessage functions will be called in chatmode
  */
-std::string getPostMessage()
+std::string getPostMessage(std::ifstream& testfile)
 {
+    std::string post;
     char buf[MAX_DATA];
-    while (1) {
-	    fgets(buf, MAX_DATA, stdin);
+    if(testfile.is_open() && testfile){
+    	 std::getline(testfile, post); 
+    }
+    else{
+       while (1) {
+            fgets(buf, MAX_DATA, stdin);
 	    if (buf[0] != '\n')  break;
+        }	   
+        std::string message(buf);
+        post = message;
     }
 
-    std::string message(buf);
-    return message;
+   
+    return post;
 }
 
 void displayPostMessage(const std::string& sender, const std::string& message, std::time_t& time)
 {
     std::string t_str(std::ctime(&time));
     t_str[t_str.size()-1] = '\0';
-    //std::cout << sender << "(" << t_str << ") >> " << message << std::endl;
-    std::cout << message << std::endl;
+    std::cout << sender << "(" << t_str << ") >> " << message << std::endl;
 }
 
 void displayReConnectionMessage(const std::string& host, const std::string & port) {

@@ -47,25 +47,13 @@ PROTOC = protoc
 GRPC_CPP_PLUGIN = grpc_cpp_plugin
 GRPC_CPP_PLUGIN_PATH ?= `which $(GRPC_CPP_PLUGIN)`
 
-
-#In the  Makefile
-DEBUG ?= 0
-ifeq ($(DEBUG), 1)
-    CXXFLAGS+=-DDEBUG
-else
-    CXXFLAGS+=-DNDEBUG
-endif
-
-all: system-check tsc tsd routing_server
-
-routing_server: sns.pb.o sns.grpc.pb.o routing_server.o
-	$(CXX) $^ $(LDFLAGS) -g -o $@ 
+all: system-check tsc tsd 
 
 tsc: sns.pb.o sns.grpc.pb.o tsc.o
-	$(CXX) $^ $(LDFLAGS) -g -o $@ 
+	$(CXX) $^ $(LDFLAGS) -g -o $@
 
 tsd: sns.pb.o sns.grpc.pb.o tsd.o
-	$(CXX) $^ $(LDFLAGS) -g -o $@ 
+	$(CXX) $^ $(LDFLAGS) -g -o $@
 
 .PRECIOUS: %.grpc.pb.cc
 %.grpc.pb.cc: %.proto

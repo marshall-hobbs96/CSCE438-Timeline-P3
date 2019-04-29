@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -6,7 +7,6 @@
 #include <unistd.h>
 #include <grpc++/grpc++.h>
 #include "client.h"
-#include <exception>
 
 #include "sns.grpc.pb.h"
 using grpc::Channel;
@@ -19,10 +19,8 @@ using csce438::Message;
 using csce438::ListReply;
 using csce438::Request;
 using csce438::Reply;
-using csce438::Empty;
-using csce438::ServerId;
 using csce438::SNSService;
-using csce438::RoutingService;
+using csce438::Regmessage;
 
 Message MakeMessage(const std::string& username, const std::string& msg) {
     Message m;
@@ -40,155 +38,216 @@ class Client : public IClient
     public:
         Client(const std::string& hname,
                const std::string& uname,
-               const std::string& p)
-            :routing_hostname(hname), username(uname), routing_port(p)
+               const std::string& p,
+               const std::string& shname,
+               const std::string& sp
+	     )
+            :hostname(hname), username(uname), port(p), slavehostname(shname), slaveport(sp)
             {}
     protected:
         virtual int connectTo();
         virtual IReply processCommand(std::string& input);
         virtual void processTimeline();
     private:
-        std::string routing_hostname;
-        std::string routing_port;
         std::string hostname;
         std::string username;
         std::string port;
-        int server_pid;
-        std::unique_ptr<RoutingService::Stub> routing_stub;
-        std::unique_ptr<SNSService::Stub> stub_;
+        std::string slavehostname;
+        std::string slaveport;
 
-        // Routing Service
-        void ConnectToRoutingServer();
-        int GetAvailableServer();
-        int ConnectToAvailableServer();
+        // You can have an instance of the client stub
+        // as a member variable.
+        std::unique_ptr<SNSService::Stub> stub_;  //to master
+	    std::unique_ptr<SNSService::Stub> stubR_; //to routing server
 
-        // SNS Service
-        IReply runCommand(std::string& input);
         IReply Login();
         IReply List();
         IReply Follow(const std::string& username2);
         IReply UnFollow(const std::string& username2);
         void Timeline(const std::string& username);
+
+
 };
+
+std::ifstream in;
+
 
 int main(int argc, char** argv) {
 
-    std::string routing_hostname = "localhost";
+    std::string hostname = "10.0.2.15";
     std::string username = "default";
-    std::string routing_port = "3010";
+    std::string port = "16666";
+    std::string infile;
     int opt = 0;
-    while ((opt = getopt(argc, argv, "h:u:p:")) != -1){
+    while ((opt = getopt(argc, argv, "h:u:p:s:")) != -1){
         switch(opt) {
             case 'h':
-                routing_hostname = optarg;break;
+                hostname = optarg;break;
             case 'u':
                 username = optarg;break;
             case 'p':
-                routing_port = optarg;break;
+                port = optarg;break;
+            case 's':
+                infile = optarg;
+                std::cout<<"FILE:"<<infile<<std::endl;
+                in.open(infile);
+                break;
+
             default:
                 std::cerr << "Invalid Command Line Argument\n";
         }
     }
-
-    // Run client
-    Client myc(routing_hostname, username, routing_port);
-    myc.run_client();
+    std::cout<<"File open:"<<in.is_open()<<std::endl;
+    std::cout<<"My name is:"<<username<<std::endl;
+    Client myc(hostname, username, port, "","");
+    // You MUST invoke "run_client" function to start business logic
+    myc.run_client(in);
 
     return 0;
 }
 
 int Client::connectTo()
 {
-    ConnectToRoutingServer();
-    int grpc_status = -1;
-
-    while (grpc_status != 1) {
-        if (GetAvailableServer() == -1)
-            return -1;
-        grpc_status = ConnectToAvailableServer();
-
-        // -1 signifies that there is no server currently available
-        if (server_pid == -1) {
-            grpc_status = -1;
-            continue;
-        }
-    }
-    return 1;
-}
-
-void Client::ConnectToRoutingServer() {
-    std::string login_info = routing_hostname + ":" + routing_port;
-    routing_stub = std::unique_ptr<RoutingService::Stub>(RoutingService::NewStub(
-        grpc::CreateChannel(login_info, grpc::InsecureChannelCredentials())));
-}
-
-int Client::GetAvailableServer() {
-    ClientContext context;
-    Empty empty;
-    ServerId id;
-
-    Status status = routing_stub->GetAvailableServer(&context, empty, &id);
-    if(!status.ok()) {
-        return -1;
-    }
-
-    hostname = id.hostname();
-    port = id.port();
-    server_pid = id.pid();
-
-    return 1;
-}
-
-int Client::ConnectToAvailableServer() {
+	// ------------------------------------------------------------
+    // In this function, you are supposed to create a stub so that
+    // you call service methods in the processCommand/porcessTimeline
+    // functions. That is, the stub should be accessible when you want
+    // to call any service methods in those functions.
+    // I recommend you to have the stub as
+    // a member variable in your own Client class.
+    // Please refer to gRpc tutorial how to create a stub.
+	// ------------------------------------------------------------
+    //connect Routing server to get available master server information
     std::string login_info = hostname + ":" + port;
-    stub_ = std::unique_ptr<SNSService::Stub>(SNSService::NewStub(
-        grpc::CreateChannel(login_info, grpc::InsecureChannelCredentials())));
+    stubR_ = std::unique_ptr<SNSService::Stub>(SNSService::NewStub(
+               grpc::CreateChannel(
+                    login_info, grpc::InsecureChannelCredentials())));
 
-    IReply ire = Login();
-    if(!ire.grpc_status.ok()) {
-        return -1;
-    }
-    return 1;
+    Reply reply;
+    Request request;
+    Regmessage regmsg;
+    request.set_username(username);
+    std::cout<<"try Connect to routing server:" + login_info<<std::endl;
+    
+    std::string curhost;
+    std::string curport;
+    IReply ire;
+    while(1){
+        if(slavehostname==""){
+           ClientContext context;
+           Status status = stubR_->Login(&context, request, &reply);
+           login_info = reply.hostname() + ":" + reply.port();
+           //std::cout<<"try Connect to:" + login_info<<std::endl;
+
+           hostname = reply.hostname();
+           port = reply.port();       
+           slavehostname = reply.slavehostname();
+           slaveport = reply.slaveport();
+
+           curhost = hostname;
+           curport = port;
+ 
+        }
+        else{
+
+           ClientContext context1;
+           regmsg.set_hostname(hostname);
+           regmsg.set_port(port);
+	   stubR_->Report(&context1, regmsg, &reply);
+           curhost = slavehostname;
+           curport = slaveport;
+ 	   
+        }
+        login_info = curhost + ":" + curport;
+
+       std::cout<<"try Connect to:" + login_info <<std::endl;
+       if(login_info==":"){
+	   return -1;
+       }
+       else{
+
+       }
+       stub_ = std::unique_ptr<SNSService::Stub>(SNSService::NewStub(
+           grpc::CreateChannel(login_info, grpc::InsecureChannelCredentials())));
+	  
+       ire = Login();
+	    
+       if(!ire.grpc_status.ok()) {
+          //Report the server is not available
+          ClientContext context1;
+          regmsg.set_hostname(curhost);
+          regmsg.set_port(curport);
+	  stubR_->Report(&context1, regmsg, &reply);
+          if(slaveport==curport) slavehostname="";
+
+       }
+       else{
+            std::cout<<"Connected to:" + login_info<<std::endl;
+	    return 1;
+       }
+   }
 }
-
 
 IReply Client::processCommand(std::string& input)
 {
-    IReply ire = runCommand(input);
-    while (!ire.grpc_status.ok()) {
-
-        // Report bad server
-        ClientContext context;
-        ServerId id;
-        id.set_pid(server_pid);
-        id.set_hostname(hostname);
-        id.set_port(port);
-        Empty empty;
-        routing_stub->RemoveServer(&context, id, &empty);
-
-        // get new available server info fromm routing server
-        GetAvailableServer();
-
-        // connect to new available server
-        ConnectToAvailableServer();
-
-        // resend command
-        ire = runCommand(input);
-    }
-    return ire;
-}
-
-IReply Client::runCommand(std::string& input)
-{
+	// ------------------------------------------------------------
+	// GUIDE 1:
+	// In this function, you are supposed to parse the given input
+    // command and create your own message so that you call an 
+    // appropriate service method. The input command will be one
+    // of the followings:
+	//
+	// FOLLOW <username>
+	// UNFOLLOW <username>
+	// LIST
+    // TIMELINE
+	//
+	// - JOIN/LEAVE and "<username>" are separated by one space.
+	// ------------------------------------------------------------
+	
+    // ------------------------------------------------------------
+	// GUIDE 2:
+	// Then, you should create a variable of IReply structure
+	// provided by the client.h and initialize it according to
+	// the result. Finally you can finish this function by returning
+    // the IReply.
+	// ------------------------------------------------------------
+    
+    
+	// ------------------------------------------------------------
+    // HINT: How to set the IReply?
+    // Suppose you have "Join" service method for JOIN command,
+    // IReply can be set as follow:
+    // 
+    //     // some codes for creating/initializing parameters for
+    //     // service method
+    //     IReply ire;
+    //     grpc::Status status = stub_->Join(&context, /* some parameters */);
+    //     ire.grpc_status = status;
+    //     if (status.ok()) {
+    //         ire.comm_status = SUCCESS;
+    //     } else {
+    //         ire.comm_status = FAILURE_NOT_EXISTS;
+    //     }
+    //      
+    //      return ire;
+    // 
+    // IMPORTANT: 
+    // For the command "LIST", you should set both "all_users" and 
+    // "following_users" member variable of IReply.
+	// ------------------------------------------------------------
     IReply ire;
     std::size_t index = input.find_first_of(" ");
     if (index != std::string::npos) {
         std::string cmd = input.substr(0, index);
+
+
         /*
         if (input.length() == index + 1) {
             std::cout << "Invalid Input -- No Arguments Given\n";
         }
         */
+
         std::string argument = input.substr(index+1, (input.length()-index));
 
         if (cmd == "FOLLOW") {
@@ -212,6 +271,23 @@ IReply Client::runCommand(std::string& input)
 void Client::processTimeline()
 {
     Timeline(username);
+	// ------------------------------------------------------------
+    // In this function, you are supposed to get into timeline mode.
+    // You may need to call a service method to communicate with
+    // the server. Use getPostMessage/displayPostMessage functions
+    // for both getting and displaying messages in timeline mode.
+    // You should use them as you did in hw1.
+	// ------------------------------------------------------------
+
+    // ------------------------------------------------------------
+    // IMPORTANT NOTICE:
+    //
+    // Once a user enter to timeline mode , there is no way
+    // to command mode. You don't have to worry about this situation,
+    // and you can terminate the client program by pressing
+    // CTRL-C (SIGINT)
+	// ------------------------------------------------------------
+    return;
 }
 
 IReply Client::List() {
@@ -224,14 +300,16 @@ IReply Client::List() {
 
     //Context for the client
     ClientContext context;
-    Status status = stub_->List(&context, request, &list_reply);
 
+    Status status = stub_->List(&context, request, &list_reply);
     IReply ire;
     ire.grpc_status = status;
     //Loop through list_reply.all_users and list_reply.following_users
     //Print out the name of each room
     if(status.ok()){
         ire.comm_status = SUCCESS;
+        std::string all_users;
+        std::string following_users;
         for(std::string s : list_reply.all_users()){
             ire.all_users.push_back(s);
         }
@@ -241,7 +319,7 @@ IReply Client::List() {
     }
     return ire;
 }
-
+        
 IReply Client::Follow(const std::string& username2) {
     Request request;
     request.set_username(username);
@@ -252,11 +330,13 @@ IReply Client::Follow(const std::string& username2) {
 
     Status status = stub_->Follow(&context, request, &reply);
     IReply ire; ire.grpc_status = status;
-    if (reply.msg() == "Follow Failed -- Invalid Username") {
+    if (reply.msg() == "Join Failed -- Invalid Username") {
         ire.comm_status = FAILURE_INVALID_USERNAME;
-    } else if (reply.msg() == "Follow Failed -- Already Following User") {
+    } else if (reply.msg() == "unknown follower username") {
+        ire.comm_status = FAILURE_INVALID_USERNAME;
+    } else if (reply.msg() == "Join Failed -- Already Following User") {
         ire.comm_status = FAILURE_ALREADY_EXISTS;
-    } else if (reply.msg() == "Follow Successful") {
+    } else if (reply.msg() == "Join Successful") {
         ire.comm_status = SUCCESS;
     } else {
         ire.comm_status = FAILURE_UNKNOWN;
@@ -277,11 +357,11 @@ IReply Client::UnFollow(const std::string& username2) {
     Status status = stub_->UnFollow(&context, request, &reply);
     IReply ire;
     ire.grpc_status = status;
-    if (reply.msg() == "UnFollow Failed -- Invalid Username") {
+    if (reply.msg() == "Leave Failed -- Invalid Username") {
         ire.comm_status = FAILURE_INVALID_USERNAME;
-    } else if (reply.msg() == "UnFollow Failed -- Not Following User") {
+    } else if (reply.msg() == "Leave Failed -- Not Following User") {
         ire.comm_status = FAILURE_INVALID_USERNAME;
-    } else if (reply.msg() == "UnFollow Successful") {
+    } else if (reply.msg() == "Leave Successful") {
         ire.comm_status = SUCCESS;
     } else {
         ire.comm_status = FAILURE_UNKNOWN;
@@ -300,7 +380,7 @@ IReply Client::Login() {
 
     IReply ire;
     ire.grpc_status = status;
-    if (reply.msg() == "Invalid Username") {
+    if (reply.msg() == "you have already joined") {
         ire.comm_status = FAILURE_ALREADY_EXISTS;
     } else {
         ire.comm_status = SUCCESS;
@@ -309,40 +389,52 @@ IReply Client::Login() {
 }
 
 void Client::Timeline(const std::string& username) {
-    while (true) {
-        GetAvailableServer();
-        ConnectToAvailableServer();
+  
+    while(true) {
+        
+        Request request;
+        request.set_username(username);
+
+        //get latest follower
+        ListReply list_reply;
+        ClientContext context1;
+        Status status = stub_->Subscription(&context1, request, &list_reply);
+
 
         ClientContext context;
         std::shared_ptr<ClientReaderWriter<Message, Message>> stream(
                 stub_->Timeline(&context));
 
+
         //Thread used to read chat messages and send them to the server
         std::thread writer([username, stream]() {
-                std::string input = "Set Stream";
-                Message m = MakeMessage(username, input);
+            std::string input = "Set Stream";
+            Message m = MakeMessage(username, input);
+            stream->Write(m);
+            while (1) {
+                input = getPostMessage(in);
+                m = MakeMessage(username, input);
                 stream->Write(m);
-                while (1) {
-                    input = getPostMessage();
-                    m = MakeMessage(username, input);
-                    stream->Write(m);
-                }
+            }
+
                 stream->WritesDone();
             });
 
         std::thread reader([username, stream]() {
                 Message m;
                 while(stream->Read(&m)){
-                    google::protobuf::Timestamp temptime = m.timestamp();
-                    std::time_t time = temptime.seconds();
-                    displayPostMessage(m.username(), m.msg(), time);
+
+                google::protobuf::Timestamp temptime = m.timestamp();
+                std::time_t time = temptime.seconds();
+                displayPostMessage(m.username(), m.msg(), time);
                 }
-            });
+                });
 
-        //If proceeding beyond this join, the server probably crashed
+        //Wait for the threads to finish
+       
         reader.join();
+        writer.join();
+        
     }
-
-
 }
 

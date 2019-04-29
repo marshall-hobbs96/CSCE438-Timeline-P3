@@ -7,13 +7,13 @@
  * modification, are permitted provided that the following conditions are
  * met:
  *
- *         * Redistributions of source code must retain the above copyright
+ *     * Redistributions of source code must retain the above copyright
  * notice, this list of conditions and the following disclaimer.
- *         * Redistributions in binary form must reproduce the above
+ *     * Redistributions in binary form must reproduce the above
  * copyright notice, this list of conditions and the following disclaimer
  * in the documentation and/or other materials provided with the
  * distribution.
- *         * Neither the name of Google Inc. nor the names of its
+ *     * Neither the name of Google Inc. nor the names of its
  * contributors may be used to endorse or promote products derived from
  * this software without specific prior written permission.
  *
@@ -41,33 +41,28 @@
 #include <memory>
 #include <string>
 #include <stdlib.h>
-#include <sys/types.h>
 #include <unistd.h>
 #include <google/protobuf/util/time_util.h>
 #include <grpc++/grpc++.h>
-#include <bits/stdc++.h>
-#include <map>
-#include <chrono>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h> 
+#include <sys/wait.h>
 
 #include "sns.grpc.pb.h"
 
-using csce438::ListReply;
-using csce438::Message;
-using csce438::Reply;
-using csce438::Request;
-using csce438::Empty;
-using csce438::ServerId;
-using csce438::ServerIds;
-
-using csce438::SNSService;
-using csce438::RoutingService;
-
-using google::protobuf::Duration;
-using google::protobuf::Timestamp;
-
 using grpc::Channel;
 using grpc::ClientContext;
+using grpc::ClientReader;
+using grpc::ClientReaderWriter;
+using grpc::ClientWriter;
 
+using google::protobuf::Timestamp;
+using google::protobuf::Duration;
 using grpc::Server;
 using grpc::ServerBuilder;
 using grpc::ServerContext;
@@ -75,537 +70,666 @@ using grpc::ServerReader;
 using grpc::ServerReaderWriter;
 using grpc::ServerWriter;
 using grpc::Status;
+using csce438::Message;
+using csce438::ListReply;
+using csce438::Request;
+using csce438::Reply;
+using csce438::SNSService;
+using csce438::Regmessage;
 
-using namespace std;
+enum serverRole{
+  router,
+  master,
+  slave,
+  router_slave
+} role;
 
-struct Client
-{
-    string username;
-    bool connected = true;
-    int following_file_size = 0;
-    vector<Client *> client_followers;
-    vector<Client *> client_following;
-    ServerReaderWriter<Message, Message> *stream = 0;
-    bool operator==(const Client &c1) const
-    {
-        return (username == c1.username);
-    }
+struct Client {
+  std::string username;
+  bool connected = true;
+  int following_file_size = 0;
+  std::vector<Client*> client_followers;
+  std::vector<Client*> client_following;
+  std::vector<std::string> followers;
+  ServerReaderWriter<Message, Message>* stream = 0;
+  bool operator==(const Client& c1) const{
+    return (username == c1.username);
+  }
 };
 
-string routing_hostname;
-string routing_port;
-string hostname;
-string port;
-unique_ptr<RoutingService::Stub> routing_stub;
+struct ServerInfo {
+  std::string hostname;
+  std::string port;
+  bool isAvailable;
+  int clientCount;
+};
+std::vector<ServerInfo> server_db;
 
 //Vector that stores every client that has been created
-vector<Client *> client_db;
+std::vector<Client> client_db;
 
-
+ std::unique_ptr<SNSService::Stub> stubR_;  //to routing server
+  std::string mode;
+google::protobuf::Timestamp lastPostTime;
 //Helper function used to find a Client object given its username
-int find_user(string username)
-{
-    int index = 0;
-    for (Client *c : client_db)
-    {
-        if (c->username == username)
-            return index;
-        index++;
+int find_user(std::string username){
+  int index = 0;
+  for(Client c : client_db){
+    if(c.username == username){
+      return index;
+      
     }
-    return -1;
+    index++;
+  }
+
+  
+
+  return -1;
 }
 
-void update_stream(string username, ServerReaderWriter<Message, Message> *stream)
-{
-    /*
-    for (Client* c : client_db) {
-        if (username == c->username)
-            c->stream = stream;
-        else {
-            for (Client f : c->client_followers) {
-
-            }
-        }
-    }
-    */
+int find_server(std::string hostname, std::string port){
+  int index = 0;
+  for(ServerInfo s : server_db){
+    if(s.hostname == hostname && s.port == port)
+      return index;
+    index++;
+  }
+  return -1;
 }
 
-void write_userlist()
-{
-    string filename = "userlist.txt";
-    ofstream user_file(filename, ios::trunc | ios::out | ios::in);
-    for (Client *c : client_db)
-    {
-        user_file << c->username << " " << c->following_file_size << endl;
-        vector<Client *>::const_iterator it;
-        for (it = c->client_followers.begin(); it != c->client_followers.end(); it++)
-        {
-            user_file << (*it)->username << " ";
-        }
-        user_file << endl;
-        for (it = c->client_following.begin(); it != c->client_following.end(); it++)
-        {
-            user_file << (*it)->username << " ";
-        }
-        user_file << endl;
+int find_server_available(){
+  int index = 0;
+  for(ServerInfo s : server_db){
+    if(s.isAvailable==true)
+      return index;
+    index++;
+  }
+  return -1;
+}
+ 
+
+class SNSServiceImpl final : public SNSService::Service {
+  //register
+  Status Register(ServerContext* context, const Regmessage* request, Reply* reply) override {
+
+    int index = find_server(request->hostname(),request->port());
+    if(index>=0){
+        ServerInfo server = server_db[index];
+        server.isAvailable = true;
+        std::cout<<request->hostname()<<":"<<request->port()<<" is available again"<<std::endl;
+	server.clientCount=0;
     }
+    else{
+        ServerInfo server;
+        server.hostname = request->hostname();
+        server.port = request->port();
+        server.isAvailable = true;
+        server_db.push_back(server);
+        std::cout<<request->hostname()<<":"<<request->port()<<" is added."<<std::endl << server.isAvailable<< std::endl;
+        server.clientCount=0;
+    }
+    //index = find_server_available();
+    //if(index<0){
+    //   server.isAvailable = true;
+    //}
+    return Status::OK;
+  }
+  //report
+  Status Report(ServerContext* context, const Regmessage* request, Reply* reply) override {
+
+    int index = find_server(request->hostname(),request->port());
+    if(index>=0){
+        //ServerInfo server = server_db[index];
+        //server.isAvailable = false;
+        server_db[index].isAvailable = false;
+        //turn on next one to available
+        //for(int i = 0; i< server_db.size(); i++){
+        //  if(i!=index)
+        //  {
+        //    server_db[i].isAvailable = true;
+        //    break;
+        //  }
+        //}
+        std::cout<<request->hostname()<<":"<<request->port()<<" is unavailabe"<<std::endl;
+    }
+  
+    return Status::OK;
 }
 
-void read_userlist()
-{
-    ifstream in("userlist.txt");
-    map<string, vector<string>> followers;
-    map<string, vector<string>> followings;
+//for router server to publish user information
+  Status Subscription(ServerContext* context, const Request* request, ListReply* list_reply1) override {
+      Request request1;
+      request1.set_username(request->username());
 
-    string line1;
-    while (getline(in, line1))
-    {
-        Client *c = new Client();
-        stringstream s_line1(line1);
-        string username;
-        string file_size;
+      //Container for the data from the server
+       ListReply list_reply;
 
-        getline(s_line1, username, ' ');
-        getline(s_line1, file_size, ' ');
-        c->username = username;
-        c->following_file_size = atoi(file_size.c_str());
-        client_db.push_back(c);
+      //Context for the client
+      ClientContext context1;
 
-        string line2, line3, item;
-        vector<string> v_followers, v_followings;
-        getline(in, line2);
-        stringstream s_line2(line2);
-        while (getline(s_line2, item, ' '))
-        {
-            v_followers.push_back(item);
-        }
-        followers[username] = v_followers;
-
-        getline(in, line3);
-        stringstream s_line3(line3);
-        while (getline(s_line3, item, ' '))
-        {
-            v_followings.push_back(item);
-        }
-        followings[username] = v_followings;
-    }
-
-    map<string, vector<string>>::iterator it;
-    for (it = followers.begin(); it != followers.end(); it++)
-    {
-        string username = it->first;
-        vector<string> v_followers = it->second;
-        Client *user = client_db[find_user(username)];
-
-        vector<string>::const_iterator itt;
-        for (itt = v_followers.begin(); itt != v_followers.end(); itt++)
-        {
-            user->client_followers.push_back(client_db[find_user(*itt)]);
-        }
-    }
-    for (it = followings.begin(); it != followings.end(); it++)
-    {
-        string username = it->first;
-        vector<string> v_followings = it->second;
-        Client *user = client_db[find_user(username)];
-
-        vector<string>::const_iterator itt;
-        for (itt = v_followings.begin(); itt != v_followings.end(); itt++)
-        {
-            user->client_following.push_back(client_db[find_user(*itt)]);
-        }
-    }
-}
-
-void ConnectToRoutingServer() {
-    string login_info = routing_hostname + ":" + routing_port;
-    cout << "Connecting to routing server at " + login_info + "\n";
-    routing_stub = unique_ptr<RoutingService::Stub>(RoutingService::NewStub(
-        grpc::CreateChannel(login_info, grpc::InsecureChannelCredentials())));
-
-    ClientContext context;
-    Empty empty;
-    ServerId id;
-    id.set_pid((int)getpid());
-    id.set_hostname(hostname);
-    id.set_port(port);
-
-    Status status = routing_stub->AddServer(&context, id, &empty);
-}
-
-int SetAvailableServer() {
-    ClientContext context;
-    ServerId id;
-    id.set_pid(getpid());
-    id.set_hostname(hostname);
-    id.set_port(port);
-    Empty empty;
-
-    routing_stub->SetAvailableServer(&context, id, &empty);
-    cout << "Elected self as available server!\n";
-}
-
-int RunElection() {
-    ClientContext context;
-    Empty empty;
-    ServerIds ids;
-    Status status = routing_stub->GetServerIds(&context, empty, &ids);
-
-    // If this is the only server, set it as the available server
-    if (ids.ids_size() == 1) {
-        cout << "This is the only server connected to the routing server!\n";
-        return SetAvailableServer();
-    }
+      Status status = stubR_->List(&context1, request1, &list_reply);
+   
+     
     
-    // Send election checks to all servers with greater pids
-    int num_larger_ids = 0;
-    int num_bad_replies = 0;
-    for (auto id : ids.ids()) {
-        if (id.pid() < getpid())
-            continue;
+      Client c;
+      std::string username = request->username();
+      int user_index = find_user(username);
+      if(user_index < 0){
+        c.username = username;
+        for(std::string s : list_reply.followers()){
+            c.followers.push_back(s);
+        }
+        client_db.push_back(c);
+      }
+      else{ 
+        Client *user = &client_db[user_index];
+        user->followers.clear();
+        for(std::string s : list_reply.followers()){
+            user->followers.push_back(s);
+        }
+      }
+	   
+    
+    return Status::OK;
+  }
 
-        if (id.pid() == getpid() && id.port() == port && id.hostname() == hostname)
-            continue;
+  //master
+  Status List(ServerContext* context, const Request* request, ListReply* list_reply) override {
+     if(server_db.size()>0){
+	    //std::cout << "List function 0" << std::endl;
 
-        num_larger_ids++;
+	    Client user = client_db[find_user(request->username())];
+	    int index = 0;
+	    for(Client c : client_db){
+	      list_reply->add_all_users(c.username);
+	    }
 
-        auto stub = unique_ptr<SNSService::Stub>(SNSService::NewStub(
-            grpc::CreateChannel(id.hostname() + ":" + id.port(), grpc::InsecureChannelCredentials())));
+	    //std::cout << "List function 1" << std::endl;
+
+	    std::vector<Client*>::const_iterator it;
+	    for(it = user.client_followers.begin(); it!=user.client_followers.end(); it++){
+	      list_reply->add_followers((*it)->username);
+	    }
+
+	    //std::cout << "List function 2" << std::endl;
+    }
+    else{
+        ClientContext context1;
+	Status status = stubR_->List(&context1, *request, list_reply);
+    }
+    return Status::OK;
+  }
+
+  Status Follow(ServerContext* context, const Request* request, Reply* reply) override {
+    if(server_db.size()>0){
+	    std::string username1 = request->username();
+	    std::string username2 = request->arguments(0);
+	    int join_index = find_user(username2);
+	    if(join_index < 0 || username1 == username2)
+	      reply->set_msg("Join Failed -- Invalid Username");
+	    else{
+	      Client *user1 = &client_db[find_user(username1)];
+	      Client *user2 = &client_db[join_index];
+	      if(std::find(user1->client_following.begin(), user1->client_following.end(), user2) != user1->client_following.end()){
+		reply->set_msg("Join Failed -- Already Following User");
+		return Status::OK;
+	      }
+	      user1->client_following.push_back(user2);
+	      user2->client_followers.push_back(user1);
+	      reply->set_msg("Join Successful");
+	    }
+    }
+    else{
+        std::cout<<"follow:"<<request->arguments(0)<<std::endl;
+	ClientContext context1;
+        Status status = stubR_->Follow(&context1, *request, reply);
+        std::cout<<"followmsg:"<<reply->msg()<<std::endl;
+    }
+    return Status::OK; 
+  }
+
+  Status UnFollow(ServerContext* context, const Request* request, Reply* reply) override {
+    if(server_db.size()>0){
+	    std::string username1 = request->username();
+	    std::string username2 = request->arguments(0);
+	    int leave_index = find_user(username2);
+	    if(leave_index < 0 || username1 == username2)
+	      reply->set_msg("Leave Failed -- Invalid Username");
+	    else{
+	      Client *user1 = &client_db[find_user(username1)];
+	      Client *user2 = &client_db[leave_index];
+	      if(std::find(user1->client_following.begin(), user1->client_following.end(), user2) == user1->client_following.end()){
+		reply->set_msg("Leave Failed -- Not Following User");
+		return Status::OK;
+	      }
+	      user1->client_following.erase(find(user1->client_following.begin(), user1->client_following.end(), user2)); 
+	      user2->client_followers.erase(find(user2->client_followers.begin(), user2->client_followers.end(), user1));
+	      reply->set_msg("Leave Successful");
+	    }
+    }
+   else{
+	ClientContext context1;
+        std::cout<<"unfollow:"<<request->arguments(0)<<std::endl;
+        Status status = stubR_->UnFollow(&context1, *request, reply);
+        std::cout<<"unfollowmsg:"<<reply->msg()<<std::endl;
+ 
+   }
+
+    return Status::OK;
+  }
+  
+  Status Login(ServerContext* context, const Request* request, Reply* reply) override {
+
+      //std::string hostname,port;
+      std::cout<<"DB size:"<<server_db.size()<<std::endl<<"role:"<<role<<std::endl;
+	
+      if(server_db.size()>0){
+	//router
+	  int minc=1000;
+          int minIndex=0;
+
+          //find minimum load server
+	  for(int i = 0; i< server_db.size(); i++){
+	      if(server_db[i].isAvailable  && server_db[i].clientCount<=minc){
+		   minc = server_db[i].clientCount;
+		   minIndex = i;
+	      }
+          }
         
-        ClientContext context;
-        Empty empty1;
-        Empty empty2;
-        status = stub->HoldElection(&context, empty1, &empty2);
 
-        if (!status.ok()) {
-            num_bad_replies++;
+          //Find next available as slave server
+	  int slaveIndex = -1;
+	  for(int i = minIndex + 1; i< server_db.size(); i++){
+	      if(server_db[i].isAvailable){
+		 slaveIndex = i;  
+	      }
+          }
+	  if(slaveIndex == -1){
+              for(int i = 0; i< minIndex; i++){
+	           if(server_db[i].isAvailable){
+		        slaveIndex = i;
+		   }  
+	      }
+          
+	  }
+	std::cout<<"server assigned:"<<minIndex<<", Slave assigned:"<<slaveIndex<<std::endl;	
+	int i = minIndex;
+ 	reply->set_msg("Login Successful!");
+	reply->set_hostname(server_db[i].hostname);
+	reply->set_port(server_db[i].port);
+	server_db[i].clientCount ++;
+        std::cout<<server_db[i].hostname<<":"<<server_db[i].port<<" was routed"<<std::endl;
+		  
 
-            // Remove bad server from server list on routing server
-            cout << "Removing bad server " + id.hostname() +  ":" + id.port() + "\n";
-            ClientContext context;
-            Empty empty;
-            routing_stub->RemoveServer(&context, id, &empty);
+	 if(slaveIndex == -1){
+	    //Set slave server info
+	    reply->set_slavehostname("");
+	    reply->set_slaveport(""); 
+	 }
+         else{
+            reply->set_slavehostname(server_db[slaveIndex].hostname);
+	    reply->set_slaveport(server_db[slaveIndex].port);
+         }
+      }
+    
+/*
+      for(int i = 0; i< server_db.size(); i++){
+        if(server_db[i].isAvailable){
+          reply->set_msg("Login Successful!");
+          reply->set_hostname(server_db[i].hostname);
+          reply->set_port(server_db[i].port);
+	  server_db[i].clientCount ++;
+          //std::cout<<server_db[i].hostname<<":"<<server_db[i].port<<" was routed"<<std::endl;
+          break;
         }
-    }
-
-    // If the number of messages sent out equals the number of non-replies
-    // then this server should be set as the available server
-    if (num_larger_ids == num_bad_replies) {
-        cout << "num larger ids = " << num_larger_ids << endl;
-        cout << "num bad replies = " << num_bad_replies << endl;
-        return SetAvailableServer();
-    }
-
-    return 0;
-}
-
-class SNSServiceImpl final : public SNSService::Service
-{
-    Status List(ServerContext *context, const Request *request, ListReply *list_reply) override
-    {
-        Client *user = client_db[find_user(request->username())];
-        int index = 0;
-        for (Client *c : client_db)
-        {
-            list_reply->add_all_users(c->username);
+      } 
+*/    
+      Client c;
+      std::string username = request->username();
+      int user_index = find_user(username);
+      if(user_index < 0){
+        c.username = username;
+        client_db.push_back(c);
+        reply->set_msg("Login Successful!");
+      }
+      else{ 
+        Client *user = &client_db[user_index];
+        if(user->connected)
+          reply->set_msg("Invalid Username");
+        else{
+          std::string msg = "Welcome Back " + user->username;
+	        reply->set_msg(msg);
+          user->connected = true;
         }
-        vector<Client *>::const_iterator it;
-        for (it = user->client_followers.begin(); it != user->client_followers.end(); it++)
-        {
-            list_reply->add_followers((*it)->username);
-        }
-        return Status::OK;
+      }
+    
+    return Status::OK;
+  }
+
+  Status Gettime(ServerContext* context,  const Request* request, Message* m) override {
+
+	google::protobuf::Timestamp* timestamp = new google::protobuf::Timestamp();
+        timestamp->set_seconds(time(NULL));
+        timestamp->set_nanos(0);
+        m->set_allocated_timestamp(timestamp);
+       return Status::OK;
+  }
+
+  Status Timeline(ServerContext* context, 
+		ServerReaderWriter<Message, Message>* stream) override {
+    Message message;
+    Client *c;
+    while(stream->Read(&message)) {
+      std::string username = message.username();
+      int user_index = find_user(username);
+      c = &client_db[user_index];
+ 
+      //get router time
+      Message m;
+      Request r;
+      ClientContext context1;
+      stubR_->Gettime(&context1, r, &m);
+      google::protobuf::Timestamp Routertime = m.timestamp();
+      //std::cout<<"Router time:"<<google::protobuf::util::TimeUtil::ToString(Routertime)<<std::endl;
+      std::string globaltime =  google::protobuf::util::TimeUtil::ToString(Routertime);
+
+      //Write the current message to "username.txt"
+      std::string filename = username+".txt";
+      std::ofstream user_file(filename,std::ios::app|std::ios::out|std::ios::in);
+      google::protobuf::Timestamp temptime = message.timestamp();
+      std::string time = google::protobuf::util::TimeUtil::ToString(temptime);
+      std::string fileinput = globaltime + " :: " + time+" :: "+message.username()+":"+message.msg()+"\n";
+      //"Set Stream" is the default message from the client to initialize the stream
+
+     //read last 20 message or latest message
+      std::string line;
+      std::vector<std::string> newest_twenty;
+      std::ifstream in(username+"following.txt");
+      int totalcount = 0;
+      //Read the last up-to-20 lines (newest 20 messages) from userfollowing.txt
+      //check counts
+      while(getline(in, line)){
+	if(line.length()>20) 
+           totalcount++;
+      }
+      //std::cout<<"Totalmsg:"<<totalcount<<std::endl;
+      in.clear();
+      in.seekg(0);
+      int count = 0;
+      while(getline(in, line)){
+          if(line.length()>20){
+	      count++;
+              if(count>totalcount-20){
+                  newest_twenty.push_back(line);
+	      
+              }
+	  }
+      }
+
+      if(message.msg() != "Set Stream"){
+        user_file << fileinput;
+        //print latest message
+        Message new_msg; 
+ 	//Send the newest messages to the client to be displayed
+        std::string msg;
+        std::string hastimemsg;
+        google::protobuf::Timestamp temptime;
+	for(int i = 0; i<newest_twenty.size(); i++){
+          msg = newest_twenty[i];
+           google::protobuf::util::TimeUtil::FromString(msg.substr(0, 20), &temptime);
+          if(temptime>lastPostTime){
+	      new_msg.set_msg(msg);
+              stream->Write(new_msg);
+          }
+         if(msg.length()>20) hastimemsg=msg;
+        }  
+        google::protobuf::util::TimeUtil::FromString(hastimemsg.substr(0, 20), &lastPostTime); 
+        std::cout<< "last post time1 :"<< google::protobuf::util::TimeUtil::ToString(lastPostTime)  << std::endl;
+     }
+      else{
+        //If message = "Set Stream", print the first 20 chats from the people you follow
+      
+        Message new_msg; 
+        std::string msg;
+        std::string hastimemsg;
+ 	//Send the newest messages to the client to be displayed
+	for(int i = 0; i<newest_twenty.size(); i++){
+          msg = newest_twenty[i];
+	  new_msg.set_msg(msg);
+          stream->Write(new_msg);
+          if(msg.length()>20) hastimemsg=msg;
+        }  
+        google::protobuf::util::TimeUtil::FromString(hastimemsg.substr(0, 20), &lastPostTime); 
+        std::cout<< "last post time:"<< google::protobuf::util::TimeUtil::ToString(lastPostTime)  << std::endl;
+        continue;
+      }
+      //Send the message to each follower's stream
+      /*
+      std::vector<Client*>::const_iterator it;
+      for(it = c->client_followers.begin(); it!=c->client_followers.end(); it++){
+        Client *temp_client = *it;
+      	if(temp_client->stream!=0 && temp_client->connected)
+	 temp_client->stream->Write(message);
+        //For each of the current user's followers, put the message in their following.txt file
+        std::string temp_username = temp_client->username;
+        std::string temp_file = temp_username + "following.txt";
+	std::ofstream following_file(temp_file,std::ios::app|std::ios::out|std::ios::in);
+	following_file << fileinput;
+        temp_client->following_file_size++;
+	std::ofstream user_file(temp_username + ".txt",std::ios::app|std::ios::out|std::ios::in);
+        user_file << fileinput;
+      }
+      */
+       
+      for(int i=0; i<c->followers.size(); i++){
+
+        std::string temp_username = c->followers[i];
+        std::string temp_file = temp_username + "following.txt";
+	std::ofstream following_file(temp_file,std::ios::app|std::ios::out|std::ios::in);
+	following_file << fileinput;
+	std::ofstream user_file(temp_username + ".txt",std::ios::app|std::ios::out|std::ios::in);
+        user_file << fileinput;
+      }
+
     }
+    //If the client disconnected from Chat Mode, set connected to false
+    c->connected = false;
+    return Status::OK;
+  }
 
-    Status Follow(ServerContext *context, const Request *request, Reply *reply) override
-    {
-        string username1 = request->username();
-        string username2 = request->arguments(0);
-        int join_index = find_user(username2);
-        if (join_index < 0 || username1 == username2)
-            reply->set_msg("Follow Failed -- Invalid Username");
-        else
-        {
-            Client *user1 = client_db[find_user(username1)];
-            Client *user2 = client_db[join_index];
-            if (find(user1->client_following.begin(), user1->client_following.end(), user2) != user1->client_following.end())
-            {
-                reply->set_msg("Follow Failed -- Already Following User");
-                return Status::OK;
-            }
-            user1->client_following.push_back(user2);
-            user2->client_followers.push_back(user1);
-            reply->set_msg("Follow Successful");
-
-            for (Client *c : client_db)
-            {
-                string filename = c->username + "followers.txt";
-                ofstream user_file(filename, ios::trunc | ios::out | ios::in);
-                vector<Client *>::const_iterator it;
-                for (it = c->client_followers.begin(); it != c->client_followers.end(); it++)
-                {
-                    user_file << (*it)->username << endl;
-                }
-            }
-            write_userlist();
-        }
-        return Status::OK;
-    }
-
-    Status UnFollow(ServerContext *context, const Request *request, Reply *reply) override
-    {
-        string username1 = request->username();
-        string username2 = request->arguments(0);
-        int leave_index = find_user(username2);
-        if (leave_index < 0 || username1 == username2)
-            reply->set_msg("UnFollow Failed -- Invalid Username");
-        else
-        {
-            Client *user1 = client_db[find_user(username1)];
-            Client *user2 = client_db[leave_index];
-            if (find(user1->client_following.begin(), user1->client_following.end(), user2) == user1->client_following.end())
-            {
-                reply->set_msg("UnFollow Failed -- Not Following User");
-                return Status::OK;
-            }
-            user1->client_following.erase(find(user1->client_following.begin(), user1->client_following.end(), user2));
-            user2->client_followers.erase(find(user2->client_followers.begin(), user2->client_followers.end(), user1));
-            reply->set_msg("UnFollow Successful");
-            for (Client *c : client_db)
-            {
-                string filename = c->username + "followers.txt";
-                ofstream user_file(filename, ios::trunc | ios::out | ios::in);
-                vector<Client *>::const_iterator it;
-                for (it = c->client_followers.begin(); it != c->client_followers.end(); it++)
-                {
-                    user_file << (*it)->username << endl;
-                }
-            }
-            write_userlist();
-        }
-        return Status::OK;
-    }
-
-    Status Login(ServerContext *context, const Request *request, Reply *reply) override
-    {
-        Client *c = new Client();
-        string username = request->username();
-        int user_index = find_user(username);
-        if (user_index < 0)
-        {
-            c->username = username;
-            c->client_followers.push_back(c);
-            c->client_following.push_back(c);
-            client_db.push_back(c);
-            reply->set_msg("Login Successful!");
-        }
-        else
-        {
-            Client *user = client_db[user_index];
-            if (user->connected)
-            {
-                reply->set_msg("Invalid Username");
-                return Status::OK;
-            }
-            else
-            {
-                string msg = "Welcome Back " + user->username;
-                reply->set_msg(msg);
-                user->connected = true;
-            }
-        }
-        write_userlist();
-        return Status::OK;
-    }
-
-    Status Timeline(ServerContext *context,
-                    ServerReaderWriter<Message, Message> *stream) override
-    {
-        Message message;
-        Client *c;
-        while (stream->Read(&message))
-        {
-            string username = message.username();
-            int user_index = find_user(username);
-            c = client_db[user_index];
-
-            //Write the current message to "username.txt"
-            string filename = username + ".txt";
-            ofstream user_file(filename, ios::app | ios::out | ios::in);
-            google::protobuf::Timestamp temptime = message.timestamp();
-            string time = google::protobuf::util::TimeUtil::ToString(temptime);
-            string fileinput = time + " :: " + message.username() + ":" + message.msg() + "\n";
-            //"Set Stream" is the default message from the client to initialize the stream
-            if (message.msg() != "Set Stream")
-                user_file << fileinput;
-            //If message = "Set Stream", print the first 20 chats from the people you follow
-            else
-            {
-                if (c->stream == 0)
-                {
-                    c->stream = stream;
-                    update_stream(c->username, stream);
-                }
-                string line;
-                vector<string> newest_twenty;
-                ifstream in(username + "following.txt");
-                int count = 0;
-                //Read the last up-to-20 lines (newest 20 messages) from userfollowing.txt
-                while (getline(in, line))
-                {
-                    if (c->following_file_size > 20)
-                    {
-                        if (count < c->following_file_size - 20)
-                        {
-                            count++;
-                            continue;
-                        }
-                    }
-                    newest_twenty.push_back(line);
-                }
-                Message new_msg;
-                //Send the newest messages to the client to be displayed
-                for (int i = 0; i < newest_twenty.size(); i++)
-                {
-                    new_msg.set_msg(newest_twenty[i]);
-                    stream->Write(new_msg);
-                }
-                continue;
-            }
-            //Send the message to each follower's stream
-            vector<Client *>::const_iterator it;
-            for (it = c->client_followers.begin(); it != c->client_followers.end(); it++)
-            {
-                Client *temp_client = *it;
-                if (temp_client->stream != 0 && temp_client->connected && temp_client->username != c->username)
-                {
-                    message.set_msg(fileinput);
-                    temp_client->stream->Write(message);
-                }
-                //For each of the current user's followers, put the message in their following.txt file
-                string temp_username = temp_client->username;
-                string temp_file = temp_username + "following.txt";
-                ofstream following_file(temp_file, ios::app | ios::out | ios::in);
-                following_file << fileinput;
-                temp_client->following_file_size++;
-                ofstream user_file(temp_username + ".txt", ios::app | ios::out | ios::in);
-                user_file << fileinput;
-                write_userlist();
-            }
-        }
-        //If the client disconnected from Chat Mode, set connected to false
-        c->connected = false;
-        return Status::OK;
-    }
-
-    Status CheckServer(ServerContext *context, const Empty *empty1, Empty *empty2) override
-    {
-        return Status::OK;
-    }
-
-    Status HoldElection(ServerContext *context, const Empty *empty1, Empty *empty2) override
-    {
-        cout << "Holding Election!\n";
-        RunElection();
-        return Status::OK;
-    }
 };
 
-void RunServer()
-{
-    string server_address = "0.0.0.0:" + port;
-    SNSServiceImpl service;
+void RunRoutingServer(std::string hostname, std::string port_no) {
+  std::string server_address = hostname+":"+port_no;
+  SNSServiceImpl service;
+  ServerBuilder builder;
+  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  builder.RegisterService(&service);
+  std::unique_ptr<Server> server(builder.BuildAndStart());
+  std::cout << "Routing Server listening on " << server_address << std::endl;
 
-    ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
-    unique_ptr<Server> server(builder.BuildAndStart());
-    cout << "Server listening on " << server_address << endl;
 
-    server->Wait();
+  //std::cout << "DB master Server: " << server_db.size() << std::endl;
+  server->Wait();
 }
 
-void StartMaster() {
-    cout << "PID = " << getpid() << endl;
-    read_userlist();
+void RunServer(std::string hostname, std::string port_no, std::string routingIP, std::string routingPort) {
+  
+  std::cout<<"Mode:"<< mode<<std::endl;
+  //if(mode=="R"){
+     //routingIP = "localhost:";
+     //routingPort = "3010";
+  // }
+  std::string login_info = routingIP + ":" + routingPort;
+  //std::unique_ptr<SNSService::Stub> stub_;
+  stubR_ = std::unique_ptr<SNSService::Stub>(SNSService::NewStub(
+               grpc::CreateChannel(
+                    login_info, grpc::InsecureChannelCredentials())));
 
-    ConnectToRoutingServer();
-    RunElection();
-    RunServer();
+    Regmessage request;
+    request.set_hostname(hostname);
+    request.set_port(port_no);
+    Reply reply;
+    ClientContext context;
+
+    Status status = stubR_->Register(&context, request, &reply);
+
+  std::string server_address = hostname+":"+port_no;
+  SNSServiceImpl service;
+  ServerBuilder builder;
+  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  builder.RegisterService(&service);
+  std::unique_ptr<Server> server(builder.BuildAndStart());
+  std::cout << "Master Server listening on " << server_address << std::endl;
+
+  server->Wait();
 }
 
-void MonitorMasterServer(pid_t master_pid) {
-    cout << "Starting slave process\n";
+void RunSlave(std::string port_no, pid_t master_pid, std::string hostname) {
+
+  std::cout << "Listening on slave server" << std::endl << "Master PID: " << master_pid << std::endl;
+  pid_t slave_pid = getpid();
+  std::cout << "Slave PID: " << slave_pid << std::endl;
+  int status;
+  while(1){
+
+    status = waitpid(master_pid, NULL, 0);
+
+    std::cout << status << std::endl;
+
+    if(status == -1) {
+
+      std::cout << "Master Server down, restarting..." << std::endl;
+      break;
+
+    }
+
+    else {}
+
+  }
+
+  std::string argp = port_no;
+  std::string argh = hostname;
+  system("./startup.sh &");
+  std::cout << "Successfully restarted master, shutting down..." << std::endl;
+  exit(0);
+  return;
+}
+
+int main(int argc, char** argv) {
+  
+  std::string port = "3010";
+  std::string hostname = "localhost";
+  std::string routingIP = "10.0.2.15";
+  std::string routingPort = "16666";
+  mode="";
+  int opt = 0;
     
-    while (true) {
-        if (0 != kill(master_pid, 0)) {
-            cout << "Restarting master...\n";
-
-            master_pid = getpid();
-            pid_t pid = fork();
-            if (pid > 0) {
-                break;
-            }
-            else if (pid == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-            }
-            else {
-                cout << "fork() failed!\n";
-                return;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  while ((opt = getopt(argc, argv, "p:h:r:n:q:")) != -1){
+     
+    switch(opt) {
+      case 'p':
+          port = optarg;break;
+      case 'h':
+          hostname = optarg;break;
+      case 'r':
+          mode = optarg;break;
+		   
+	  case 'n':
+	      routingIP = optarg;break;
+	  case 'q':
+          routingPort = optarg;break;
+      default:
+	  std::cerr << "Invalid Command Line Argument\n";
     }
+  }
+   
+pid_t pid;
+  pid_t master_pid = getpid();
 
-    // Restart master server
-    StartMaster();
-}
+  int sockfd;
+  struct sockaddr_in serv_addr;
+  struct hostent *server;
 
-int main(int argc, char **argv)
-{
-    routing_hostname =  "localhost";
-    routing_port = "3010";
+  int portno = atoi(port.c_str()); 
+  
 
-    hostname =  "localhost";
-    port = "3010";
+  server = gethostbyname(hostname.c_str());
+ 
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd < 0) {
+    std::cout << "ERROR opening socket" << std::endl;
+  }
+ 
+  if (server == NULL) {
+    fprintf(stderr,"ERROR, no such host\n");
+    exit(0);
+  }
+ 
+  bzero((char *) &serv_addr, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  bcopy((char *)server->h_addr,
+        (char *)&serv_addr.sin_addr.s_addr,
+        server->h_length);
+  int open = -1; 
 
-    int opt = 0;
-    while ((opt = getopt(argc, argv, "h:p:r:t:f:")) != -1)
-    {
-        switch (opt)
-        {
-        case 'h':
-            hostname = optarg;
-            break;
-        case 'p':
-            port = optarg;
-            break;
-        case 'r':
-            routing_hostname = optarg;
-            break;
-        case 't':
-            routing_port = optarg;
-            break;
-        default:
-            cerr << "Invalid Command Line Argument\n";
-        }
-    }
+  while((open == -1) && (portno < 16670)){
 
-    pid_t master_pid = getpid();
-    pid_t pid = fork();
-    if (pid == 0) {
-        // child process
-        MonitorMasterServer(master_pid);
-    }
-    else if (pid > 0) {
-        // parent process
-        StartMaster();
-    }
+    serv_addr.sin_port = htons(portno);
+
+    if (connect(sockfd,(struct sockaddr *) &serv_addr,sizeof(serv_addr)) < 0) {
+
+      std::cout << "Port is closed" << std::endl;
+      open = 0;
+
+    } 
+
     else {
-        // fork failed
-        cout << "fork() failed!\n";
-        return 1;
+
+      std::cout << "Error: Port is active. Incrementing to next port" << std::endl;
+      portno++;
+      port = std::to_string(portno);
+      std::cout << portno << std::endl << port << std::endl;
+      open = -1;
+       
     }
 
-    return 0;
+
+  }
+
+  close(sockfd);
+
+  if(portno > 16669) {
+
+    std::cout << "Error, already four (4) servers up. Cannot create new server instance. Exiting..." << std::endl;
+    exit(0);
+
+  }
+
+  pid = fork();
+
+  if(pid != 0){ //not child, run slave to monitor child/master
+
+      RunSlave(port, pid, hostname);
+
+  }
+
+  else {  //master server. We should check if routing server is up. If it is, set up on next free port
+    std::cout<<"Port:"<<port<<std::endl;
+    if(mode=="R" || (hostname=="10.0.2.15" && port=="16666")){
+	    role = router;
+        RunRoutingServer(hostname, port);
+    }
+    else{
+		role = master;
+		RunServer(hostname, port, routingIP, routingPort);
+    }
+    
+
+  }
+
+
+  return 0;
 }
+ 
+
